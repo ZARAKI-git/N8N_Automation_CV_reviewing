@@ -1,0 +1,977 @@
+
+{
+  "name": "IG Recruiting Funnel - Flow 1 + Flow 2",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## FLOW 1: Comment Trigger (locked to one reel)\n\nThis flow listens for Instagram comment webhooks from Meta. When someone comments on the **specific reel** (PLACEHOLDER_REEL_MEDIA_ID) with the keyword **\"graphics\"** (case-insensitive), it sends an opening DM via the Instagram Private Reply API (using `comment_id` as the recipient — required for the first message per Meta's spec).\n\n**Placeholders to fill in before going live:**\n- `PLACEHOLDER_REEL_MEDIA_ID` (in \"Correct Reel?\" node)\n- `IG_ACCOUNT_ID_PLACEHOLDER` (in \"Send Private Reply\" URL — or set `IG_ACCOUNT_ID` env var)\n- `META_ACCESS_TOKEN_PLACEHOLDER` (in \"Send Private Reply\" query param — or set `META_ACCESS_TOKEN` env var)\n- Webhook verify token (configured on the Webhook node / Meta App dashboard)",
+        "height": 320,
+        "width": 520,
+        "color": 4
+      },
+      "id": "sticky-note-flow1",
+      "name": "Sticky Note - Flow 1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta-ig-comments",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "meta-webhook-in",
+      "name": "Meta Webhook In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        80,
+        220
+      ],
+      "webhookId": "meta-ig-comments-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ack-comment-webhook",
+      "name": "Ack Comment Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        340,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "cond-reel-match",
+              "leftValue": "={{ $json.body.entry[0].changes[0].value.media?.id || $json.body.entry[0].changes[0].value.media_id || '' }}",
+              "rightValue": "PLACEHOLDER_REEL_MEDIA_ID",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "correct-reel-if",
+      "name": "Correct Reel?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        340,
+        320
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ignore-wrong-reel",
+      "name": "Ignore - Wrong Reel",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        600,
+        460
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "cond-keyword-match",
+              "leftValue": "={{ $json.body.entry[0].changes[0].value.text || '' }}",
+              "rightValue": "graphics",
+              "operator": {
+                "type": "string",
+                "operation": "contains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "keyword-match-if",
+      "name": "Keyword Match?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        600,
+        220
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "ignore-no-keyword",
+      "name": "Ignore - No Keyword",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        860,
+        360
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.IG_ACCOUNT_ID || 'IG_ACCOUNT_ID_PLACEHOLDER' }}/messages",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "={{ $env.META_ACCESS_TOKEN || 'META_ACCESS_TOKEN_PLACEHOLDER' }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"recipient\": {\n    \"comment_id\": \"{{ $json.body.entry[0].changes[0].value.id }}\"\n  },\n  \"message\": {\n    \"text\": \"Hey! Thanks for your interest in the graphic designer role. To apply, please send me in your next message:\\n1. Your full name\\n2. Your phone number\\n3. Your state\\n4. A link to your CV\\n5. Links to your project/portfolio work\"\n  }\n}",
+        "options": {}
+      },
+      "id": "send-private-reply",
+      "name": "Send Private Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        860,
+        180
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## FLOW 2: Conversation + Extraction + AI Triage + Sheet\n\nTriggered by Instagram DM webhook (`messages` field). Parses the applicant's reply with Claude, fetches CV + portfolio links, runs an AI triage, appends to a Google Sheet, recomputes ranking across all applicants, and confirms receipt to the applicant.\n\n**Every external call uses `continueOnFail: true` or defensive try/catch — failures never crash the workflow.**\n\n**New placeholders (Flow 2):**\n- `ANTHROPIC_CREDENTIAL_PLACEHOLDER` (credential on all 3 Anthropic nodes)\n- `GOOGLE_SHEETS_CREDENTIAL_PLACEHOLDER` (credential on all 3 Sheets nodes)\n- `GOOGLE_SHEET_ID_PLACEHOLDER` (documentId on all 3 Sheets nodes)\n- `GOOGLE_SHEET_TAB_NAME_PLACEHOLDER` (sheetName on all 3 Sheets nodes — e.g. 'Applicants')\n- `IG_ACCOUNT_ID_PLACEHOLDER` / `META_ACCESS_TOKEN_PLACEHOLDER` reused on 'Ask for Missing Info' and 'Send Confirmation DM'\n- DM webhook verify token (Meta App dashboard, `messages` field)\n\n**Model:** `claude-haiku-4-5-20251001` on every Anthropic node.",
+        "height": 360,
+        "width": 560,
+        "color": 5
+      },
+      "id": "sticky-note-flow2",
+      "name": "Sticky Note - Flow 2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -200,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "meta-ig-dms",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "dm-reply-in",
+      "name": "DM Reply In",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        80,
+        1140
+      ],
+      "webhookId": "meta-ig-dms-webhook"
+    },
+    {
+      "parameters": {
+        "respondWith": "text",
+        "responseBody": "OK",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "ack-dm-webhook",
+      "name": "Ack DM Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        340,
+        980
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract sender_id, post_id (referenced reel/story if any), and message text from Meta IG DM webhook.\n// Meta's IG messaging payload shape:\n// body.entry[].messaging[].sender.id, .message.text, .message.reply_to.story.id (when replying to a reel/story)\n\nconst out = [];\nfor (const item of items) {\n  try {\n    const body = item.json.body || item.json;\n    const entries = body.entry || [];\n    for (const entry of entries) {\n      const messagingArr = entry.messaging || [];\n      for (const m of messagingArr) {\n        // Skip echoes (messages sent BY the IG account itself)\n        if (m.message && m.message.is_echo) continue;\n\n        const sender_id = m.sender && m.sender.id ? String(m.sender.id) : '';\n        const text = (m.message && m.message.text) ? String(m.message.text) : '';\n\n        // post_id can be inferred from a story/reel reply context if present\n        let post_id = '';\n        if (m.message && m.message.reply_to) {\n          if (m.message.reply_to.story && m.message.reply_to.story.id) {\n            post_id = String(m.message.reply_to.story.id);\n          } else if (m.message.reply_to.mid) {\n            post_id = String(m.message.reply_to.mid);\n          }\n        }\n\n        if (!sender_id || !text) continue; // ignore non-text events (delivery, reads, etc.)\n\n        out.push({\n          json: {\n            sender_id,\n            post_id,\n            message_text: text,\n            received_at: new Date().toISOString()\n          }\n        });\n      }\n    }\n  } catch (err) {\n    out.push({ json: { sender_id: '', post_id: '', message_text: '', error: 'extract_failed: ' + err.message } });\n  }\n}\n\nif (out.length === 0) {\n  return [{ json: { sender_id: '', post_id: '', message_text: '', skipped: true } }];\n}\nreturn out;"
+      },
+      "id": "extract-dm-payload",
+      "name": "Extract DM Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        340,
+        1240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "claude-haiku-4-5-20251001",
+          "mode": "list",
+          "cachedResultName": "claude-haiku-4-5-20251001"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=Extract the following fields from this Instagram DM applicant message and return ONLY valid JSON, no prose, no markdown fences:\n\n{\n  \"name\": \"<full name or empty string>\",\n  \"phone\": \"<phone number or empty string>\",\n  \"state\": \"<state/region or empty string>\",\n  \"cv_link\": \"<single CV URL or empty string>\",\n  \"project_links\": [\"<url>\", \"<url>\"],\n  \"complete\": <true ONLY if name, phone, state, cv_link are all non-empty AND project_links has >= 1 entry, otherwise false>\n}\n\nApplicant message:\n\"\"\"\n{{ $json.message_text }}\n\"\"\"\n\nReturn ONLY the JSON object."
+            }
+          ]
+        },
+        "options": {
+          "maxTokensToSample": 600
+        }
+      },
+      "id": "parse-applicant-info",
+      "name": "Parse Applicant Info",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1.3,
+      "position": [
+        600,
+        1240
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "ANTHROPIC_CREDENTIAL_PLACEHOLDER",
+          "name": "Anthropic account (PLACEHOLDER)"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Defensively pull text out of whatever Claude/Anthropic node response shape we got,\n// strip code fences, JSON.parse with try/catch, merge sender_id/post_id from upstream.\n\nconst upstream = $('Extract DM Payload').first().json;\nconst sender_id = upstream.sender_id || '';\nconst post_id = upstream.post_id || '';\nconst message_text = upstream.message_text || '';\n\nfunction pickText(j) {\n  if (!j) return '';\n  if (typeof j === 'string') return j;\n  if (typeof j.text === 'string') return j.text;\n  if (Array.isArray(j.content)) {\n    return j.content.map(c => (c && (c.text || c.value)) || '').join('\\n');\n  }\n  if (j.message && Array.isArray(j.message.content)) {\n    return j.message.content.map(c => (c && (c.text || c.value)) || '').join('\\n');\n  }\n  if (j.message && typeof j.message.content === 'string') return j.message.content;\n  if (typeof j.output === 'string') return j.output;\n  if (j.output && typeof j.output.text === 'string') return j.output.text;\n  if (j.completion) return j.completion;\n  return '';\n}\n\nfunction stripFences(s) {\n  if (!s) return '';\n  let t = s.trim();\n  // strip ```json ... ``` or ``` ... ```\n  const fence = /^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i;\n  const m = t.match(fence);\n  if (m) t = m[1].trim();\n  // also catch first { ... last }\n  const first = t.indexOf('{');\n  const last = t.lastIndexOf('}');\n  if (first !== -1 && last !== -1 && last > first) {\n    t = t.slice(first, last + 1);\n  }\n  return t;\n}\n\nconst raw = items[0] ? items[0].json : {};\nconst rawText = pickText(raw);\nconst cleaned = stripFences(rawText);\n\nlet parsed = {\n  name: '',\n  phone: '',\n  state: '',\n  cv_link: '',\n  project_links: [],\n  complete: false\n};\nlet parse_error = false;\n\ntry {\n  if (cleaned) {\n    const j = JSON.parse(cleaned);\n    parsed.name = (j.name || '').toString().trim();\n    parsed.phone = (j.phone || '').toString().trim();\n    parsed.state = (j.state || '').toString().trim();\n    parsed.cv_link = (j.cv_link || '').toString().trim();\n    parsed.project_links = Array.isArray(j.project_links)\n      ? j.project_links.filter(x => typeof x === 'string' && x.trim()).map(x => x.trim())\n      : [];\n    // Recompute complete defensively\n    parsed.complete = !!(parsed.name && parsed.phone && parsed.state && parsed.cv_link && parsed.project_links.length > 0);\n  } else {\n    parse_error = true;\n  }\n} catch (e) {\n  parse_error = true;\n  parsed.complete = false;\n}\n\nconst project_links_str = parsed.project_links.join(', ');\n\nreturn [{\n  json: {\n    sender_id,\n    post_id,\n    message_text,\n    name: parsed.name,\n    phone: parsed.phone,\n    state: parsed.state,\n    cv_link: parsed.cv_link,\n    project_links: parsed.project_links,\n    project_links_str,\n    complete: parsed.complete,\n    parse_error\n  }\n}];"
+      },
+      "id": "normalize-parsed-info",
+      "name": "Normalize Parsed Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        860,
+        1240
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "cond-info-complete",
+              "leftValue": "={{ $json.complete }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "info-complete-if",
+      "name": "Info Complete?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1120,
+        1240
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "claude-haiku-4-5-20251001",
+          "mode": "list",
+          "cachedResultName": "claude-haiku-4-5-20251001"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are replying to a graphic designer applicant on Instagram DM. They've sent some info but it's incomplete. Write a SHORT, friendly follow-up (max 3 sentences, no greeting if they're mid-conversation) asking ONLY for the fields they haven't provided. Match their language style and tone from their message.\n\nRequired fields:\n- Full name\n- Phone number\n- State\n- CV link\n- Project/portfolio links\n\nWhat they provided so far:\nname: \"{{ $json.name }}\"\nphone: \"{{ $json.phone }}\"\nstate: \"{{ $json.state }}\"\ncv_link: \"{{ $json.cv_link }}\"\nproject_links: {{ JSON.stringify($json.project_links) }}\n\nTheir original message:\n\"\"\"\n{{ $json.message_text }}\n\"\"\"\n\nReturn ONLY the message text to send. No quotes, no preamble, no explanation."
+            }
+          ]
+        },
+        "options": {
+          "maxTokensToSample": 300
+        }
+      },
+      "id": "draft-missing-info",
+      "name": "Draft Missing-Info Message",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1.3,
+      "position": [
+        1380,
+        1420
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "ANTHROPIC_CREDENTIAL_PLACEHOLDER",
+          "name": "Anthropic account (PLACEHOLDER)"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.IG_ACCOUNT_ID || 'IG_ACCOUNT_ID_PLACEHOLDER' }}/messages",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "={{ $env.META_ACCESS_TOKEN || 'META_ACCESS_TOKEN_PLACEHOLDER' }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"recipient\": { \"id\": \"{{ $('Normalize Parsed Info').first().json.sender_id }}\" },\n  \"message\": { \"text\": {{ JSON.stringify( ($json.content && $json.content[0] && $json.content[0].text) || $json.text || $json.message || 'Thanks! Could you also share the remaining details (full name, phone, state, CV link, and portfolio links) so we can review your application?' ) }} }\n}",
+        "options": {}
+      },
+      "id": "ask-missing-info",
+      "name": "Ask for Missing Info",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1640,
+        1420
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.cv_link }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 5
+            }
+          }
+        }
+      },
+      "id": "fetch-cv-content",
+      "name": "Fetch CV Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1380,
+        1060
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract text from CV. Handle PDF (binary), HTML, and plain text. Never throw.\n// Truncate to ~4000 chars. On any failure: cv_text='', cv_extraction_failed=true.\n\nconst upstream = $('Normalize Parsed Info').first().json;\nconst base = { ...upstream };\n\nasync function extract() {\n  try {\n    const item = items[0];\n    if (!item) return { cv_text: '', cv_extraction_failed: true, cv_error: 'no_item' };\n\n    // Detect binary (PDF or other file)\n    const binaryKeys = item.binary ? Object.keys(item.binary) : [];\n    if (binaryKeys.length > 0) {\n      const bin = item.binary[binaryKeys[0]];\n      const mime = (bin.mimeType || '').toLowerCase();\n      const buffer = await this.helpers.getBinaryDataBuffer(0, binaryKeys[0]);\n\n      if (mime.includes('pdf') || (bin.fileName && bin.fileName.toLowerCase().endsWith('.pdf'))) {\n        // Lightweight PDF text extraction without pdf-parse: pull text between BT...ET ops & ()s\n        // This is intentionally crude — good enough for triage screening.\n        const raw = buffer.toString('latin1');\n        const matches = raw.match(/\\(([^()\\\\]{2,})\\)/g) || [];\n        let text = matches.map(s => s.slice(1, -1)).join(' ');\n        text = text.replace(/\\s+/g, ' ').trim();\n        if (!text) {\n          return { cv_text: '', cv_extraction_failed: true, cv_error: 'pdf_no_text_extracted' };\n        }\n        return { cv_text: text.slice(0, 4000), cv_extraction_failed: false };\n      }\n\n      // Treat as text\n      const asText = buffer.toString('utf8').replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();\n      return { cv_text: asText.slice(0, 4000), cv_extraction_failed: !asText };\n    }\n\n    // Non-binary: maybe HTML string body\n    const j = item.json || {};\n    let html = '';\n    if (typeof j === 'string') html = j;\n    else if (typeof j.body === 'string') html = j.body;\n    else if (typeof j.data === 'string') html = j.data;\n    else html = JSON.stringify(j);\n\n    const text = html.replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n                     .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n                     .replace(/<[^>]+>/g, ' ')\n                     .replace(/&nbsp;/g, ' ')\n                     .replace(/\\s+/g, ' ')\n                     .trim();\n\n    if (!text) return { cv_text: '', cv_extraction_failed: true, cv_error: 'empty_after_strip' };\n    return { cv_text: text.slice(0, 4000), cv_extraction_failed: false };\n  } catch (e) {\n    return { cv_text: '', cv_extraction_failed: true, cv_error: e.message };\n  }\n}\n\nconst res = await extract.call(this);\nreturn [{ json: { ...base, ...res } }];"
+      },
+      "id": "extract-cv-text",
+      "name": "Extract CV Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1640,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "fieldToSplitOut": "project_links",
+        "options": {
+          "includeBinary": false
+        }
+      },
+      "id": "split-portfolio-links",
+      "name": "Split Portfolio Links",
+      "type": "n8n-nodes-base.splitOut",
+      "typeVersion": 1,
+      "position": [
+        1900,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $json.project_links }}",
+        "options": {
+          "timeout": 15000,
+          "redirect": {
+            "redirect": {
+              "followRedirects": true,
+              "maxRedirects": 5
+            }
+          }
+        }
+      },
+      "id": "fetch-portfolio-content",
+      "name": "Fetch Portfolio Content",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2160,
+        1060
+      ],
+      "continueOnFail": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "// For each fetched portfolio link result: strip HTML, truncate ~1500 chars,\n// note thin/empty as image-heavy page. Combine all with separators.\n// Always succeed — never throw.\n\nconst cvCtx = $('Extract CV Text').first().json;\nconst links = Array.isArray(cvCtx.project_links) ? cvCtx.project_links : [];\n\nconst combined = [];\nlet idx = 0;\nfor (const item of items) {\n  const url = (item.json && (item.json.project_links || item.json.url)) || links[idx] || `link_${idx + 1}`;\n  let raw = '';\n  try {\n    const j = item.json || {};\n    if (typeof j === 'string') raw = j;\n    else if (typeof j.body === 'string') raw = j.body;\n    else if (typeof j.data === 'string') raw = j.data;\n    else if (j.error) raw = '';\n    else raw = '';\n  } catch (e) { raw = ''; }\n\n  let text = '';\n  try {\n    text = String(raw)\n      .replace(/<script[\\s\\S]*?<\\/script>/gi, ' ')\n      .replace(/<style[\\s\\S]*?<\\/style>/gi, ' ')\n      .replace(/<[^>]+>/g, ' ')\n      .replace(/&nbsp;/g, ' ')\n      .replace(/\\s+/g, ' ')\n      .trim();\n  } catch (e) { text = ''; }\n\n  let section;\n  if (!text || text.length < 80) {\n    section = `--- ${url} ---\\n[Could not extract meaningful text - likely image-heavy page]`;\n  } else {\n    section = `--- ${url} ---\\n${text.slice(0, 1500)}`;\n  }\n  combined.push(section);\n  idx++;\n}\n\nconst portfolio_text_combined = combined.join('\\n\\n') || '[No portfolio links provided or all fetches failed]';\n\nreturn [{\n  json: {\n    ...cvCtx,\n    portfolio_text_combined,\n    portfolio_links_count: links.length\n  }\n}];"
+      },
+      "id": "extract-portfolio-text",
+      "name": "Extract Portfolio Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2420,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "modelId": {
+          "__rl": true,
+          "value": "claude-haiku-4-5-20251001",
+          "mode": "list",
+          "cachedResultName": "claude-haiku-4-5-20251001"
+        },
+        "messages": {
+          "values": [
+            {
+              "content": "=You are screening a graphic designer applicant for Faiz, an e-commerce founder who is overwhelmed by DM volume and needs real triage — not flattery.\n\nGround rules:\n- Base your assessment ONLY on the extracted text below.\n- If CV text or portfolio text is empty/thin, EXPLICITLY say so in the summary and score CONSERVATIVELY.\n- NEVER invent claims about visual quality, design style, or specific projects you cannot see in the text.\n- A page marked \"[Could not extract meaningful text - likely image-heavy page]\" means you have no signal from that link — treat it as missing evidence, not as good or bad.\n\nApplicant:\n- Name: {{ $json.name }}\n- State: {{ $json.state }}\n\nCV TEXT (truncated):\n\"\"\"\n{{ $json.cv_text || '[empty]' }}\n\"\"\"\n\nPORTFOLIO TEXT (truncated, multiple links):\n\"\"\"\n{{ $json.portfolio_text_combined }}\n\"\"\"\n\nReturn ONLY valid JSON, no prose, no markdown fences:\n{\n  \"summary\": \"<3-4 sentences, explicitly note any evidence gaps>\",\n  \"score\": <integer 1-10>,\n  \"recommendation\": \"<Strong|Maybe|Pass>\"\n}"
+            }
+          ]
+        },
+        "options": {
+          "maxTokensToSample": 600
+        }
+      },
+      "id": "review-cv-projects",
+      "name": "Review CV & Projects",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1.3,
+      "position": [
+        2680,
+        1060
+      ],
+      "credentials": {
+        "anthropicApi": {
+          "id": "ANTHROPIC_CREDENTIAL_PLACEHOLDER",
+          "name": "Anthropic account (PLACEHOLDER)"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build the sheet row. Defensively parse Claude's review JSON. Never throw.\n\nconst ctx = $('Extract Portfolio Text').first().json;\nconst ai = items[0] ? items[0].json : {};\n\nfunction pickText(j) {\n  if (!j) return '';\n  if (typeof j === 'string') return j;\n  if (typeof j.text === 'string') return j.text;\n  if (Array.isArray(j.content)) {\n    return j.content.map(c => (c && (c.text || c.value)) || '').join('\\n');\n  }\n  if (j.message && Array.isArray(j.message.content)) {\n    return j.message.content.map(c => (c && (c.text || c.value)) || '').join('\\n');\n  }\n  if (j.message && typeof j.message.content === 'string') return j.message.content;\n  if (typeof j.output === 'string') return j.output;\n  if (j.completion) return j.completion;\n  return '';\n}\n\nfunction stripFences(s) {\n  if (!s) return '';\n  let t = s.trim();\n  const m = t.match(/^```(?:json)?\\s*([\\s\\S]*?)\\s*```$/i);\n  if (m) t = m[1].trim();\n  const first = t.indexOf('{');\n  const last = t.lastIndexOf('}');\n  if (first !== -1 && last !== -1 && last > first) t = t.slice(first, last + 1);\n  return t;\n}\n\nlet summary = '';\nlet score = 0;\nlet recommendation = 'Pass';\n\ntry {\n  const cleaned = stripFences(pickText(ai));\n  if (cleaned) {\n    const j = JSON.parse(cleaned);\n    summary = (j.summary || '').toString();\n    const s = parseInt(j.score, 10);\n    score = Number.isFinite(s) ? Math.max(0, Math.min(10, s)) : 0;\n    const rec = (j.recommendation || '').toString();\n    recommendation = ['Strong', 'Maybe', 'Pass'].includes(rec) ? rec : 'Pass';\n  }\n} catch (e) {\n  summary = '[AI review parse failed: ' + e.message + ']';\n  score = 0;\n  recommendation = 'Pass';\n}\n\nconst row = {\n  Timestamp: new Date().toISOString(),\n  'Post/Reel ID': ctx.post_id || '',\n  Name: ctx.name || '',\n  Phone: ctx.phone || '',\n  State: ctx.state || '',\n  'CV Link': ctx.cv_link || '',\n  'Project Links': ctx.project_links_str || '',\n  'AI Summary': summary,\n  'AI Score': score,\n  Recommendation: recommendation,\n  Rank: ''\n};\n\nreturn [{\n  json: {\n    ...ctx,\n    ai_summary: summary,\n    ai_score: score,\n    recommendation,\n    row\n  }\n}];"
+      },
+      "id": "prepare-sheet-row",
+      "name": "Prepare Sheet Row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2940,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID_PLACEHOLDER",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_TAB_NAME_PLACEHOLDER",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {
+          "useAppend": true
+        }
+      },
+      "id": "append-applicant",
+      "name": "Append Applicant",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3200,
+        1060
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_PLACEHOLDER",
+          "name": "Google Sheets account (PLACEHOLDER)"
+        }
+      },
+      "continueOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID_PLACEHOLDER",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_TAB_NAME_PLACEHOLDER",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "read-all-applicants",
+      "name": "Read All Applicants",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3460,
+        1060
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_PLACEHOLDER",
+          "name": "Google Sheets account (PLACEHOLDER)"
+        }
+      },
+      "continueOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Compute competition ranking by AI Score (desc). Ties share rank.\n// Match THIS applicant's row by Timestamp + Name fallback; if no match, fall back gracefully.\n\nconst prepared = $('Prepare Sheet Row').first().json;\nconst myTimestamp = prepared.row.Timestamp;\nconst myName = prepared.row.Name;\nconst myScore = Number(prepared.row['AI Score']) || 0;\n\nconst rows = items.map(i => i.json).filter(r => r && (r.Name || r.name));\n\n// Normalize key access (Sheet headers might be exact-case)\nfunction g(r, key) {\n  if (r[key] !== undefined) return r[key];\n  const lower = key.toLowerCase();\n  for (const k of Object.keys(r)) {\n    if (k.toLowerCase() === lower) return r[k];\n  }\n  return undefined;\n}\n\n// Build score list\nconst scored = rows.map((r, i) => ({\n  idx: i,\n  timestamp: g(r, 'Timestamp') || '',\n  name: g(r, 'Name') || '',\n  score: Number(g(r, 'AI Score')) || 0,\n  row: r\n}));\n\n// Sort desc by score\nscored.sort((a, b) => b.score - a.score);\n\n// Competition ranking (1,2,2,4,...)\nlet rank = 0;\nlet lastScore = null;\nlet seen = 0;\nfor (const s of scored) {\n  seen++;\n  if (s.score !== lastScore) {\n    rank = seen;\n    lastScore = s.score;\n  }\n  s.rank = rank;\n}\n\n// Find my row\nlet mine = scored.find(s => s.timestamp === myTimestamp && s.name === myName);\nif (!mine) mine = scored.find(s => s.timestamp === myTimestamp);\nif (!mine) mine = scored.find(s => s.name === myName && s.score === myScore);\n\nlet myRank = mine ? mine.rank : (scored.length || 1);\n// Sheet row number = header (1) + position in original rows + 1\nlet mySheetRow = mine ? (mine.idx + 2) : null;\n\nreturn [{\n  json: {\n    ...prepared,\n    computed_rank: myRank,\n    target_sheet_row: mySheetRow,\n    rank_match_ok: !!mine,\n    total_applicants: scored.length\n  }\n}];"
+      },
+      "id": "compute-rank",
+      "name": "Compute Rank",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3720,
+        1060
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_ID_PLACEHOLDER",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "GOOGLE_SHEET_TAB_NAME_PLACEHOLDER",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Timestamp": "={{ $json.row.Timestamp }}",
+            "Rank": "={{ $json.computed_rank }}"
+          },
+          "matchingColumns": [
+            "Timestamp"
+          ],
+          "schema": [
+            {
+              "id": "Timestamp",
+              "displayName": "Timestamp",
+              "required": false,
+              "defaultMatch": true,
+              "canBeUsedToMatch": true,
+              "type": "string"
+            },
+            {
+              "id": "Rank",
+              "displayName": "Rank",
+              "required": false,
+              "defaultMatch": false,
+              "canBeUsedToMatch": false,
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "update-rank-in-sheet",
+      "name": "Update Rank in Sheet",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3980,
+        1060
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "GOOGLE_SHEETS_CREDENTIAL_PLACEHOLDER",
+          "name": "Google Sheets account (PLACEHOLDER)"
+        }
+      },
+      "continueOnFail": true,
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://graph.facebook.com/v19.0/{{ $env.IG_ACCOUNT_ID || 'IG_ACCOUNT_ID_PLACEHOLDER' }}/messages",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "access_token",
+              "value": "={{ $env.META_ACCESS_TOKEN || 'META_ACCESS_TOKEN_PLACEHOLDER' }}"
+            }
+          ]
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"recipient\": { \"id\": \"{{ $('Prepare Sheet Row').first().json.sender_id }}\" },\n  \"message\": { \"text\": \"Thanks! We've received your application and the team will be in touch.\" }\n}",
+        "options": {}
+      },
+      "id": "send-confirmation-dm",
+      "name": "Send Confirmation DM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4240,
+        1060
+      ],
+      "continueOnFail": true
+    }
+  ],
+  "connections": {
+  "Meta Webhook In": {
+    "main": [
+      [
+        {
+          "node": "Ack Comment Webhook",
+          "type": "main",
+          "index": 0
+        },
+        {
+          "node": "Correct Reel?",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Correct Reel?": {
+    "main": [
+      [
+        {
+          "node": "Keyword Match?",
+          "type": "main",
+          "index": 0
+        }
+      ],
+      [
+        {
+          "node": "Ignore - Wrong Reel",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Keyword Match?": {
+    "main": [
+      [
+        {
+          "node": "Send Private Reply",
+          "type": "main",
+          "index": 0
+        }
+      ],
+      [
+        {
+          "node": "Ignore - No Keyword",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "DM Reply In": {
+    "main": [
+      [
+        {
+          "node": "Ack DM Webhook",
+          "type": "main",
+          "index": 0
+        },
+        {
+          "node": "Extract DM Payload",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Extract DM Payload": {
+    "main": [
+      [
+        {
+          "node": "Parse Applicant Info",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Parse Applicant Info": {
+    "main": [
+      [
+        {
+          "node": "Normalize Parsed Info",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Normalize Parsed Info": {
+    "main": [
+      [
+        {
+          "node": "Info Complete?",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Info Complete?": {
+    "main": [
+      [
+        {
+          "node": "Fetch CV Content",
+          "type": "main",
+          "index": 0
+        }
+      ],
+      [
+        {
+          "node": "Draft Missing-Info Message",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Draft Missing-Info Message": {
+    "main": [
+      [
+        {
+          "node": "Ask for Missing Info",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Fetch CV Content": {
+    "main": [
+      [
+        {
+          "node": "Extract CV Text",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Extract CV Text": {
+    "main": [
+      [
+        {
+          "node": "Split Portfolio Links",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Split Portfolio Links": {
+    "main": [
+      [
+        {
+          "node": "Fetch Portfolio Content",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Fetch Portfolio Content": {
+    "main": [
+      [
+        {
+          "node": "Extract Portfolio Text",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Extract Portfolio Text": {
+    "main": [
+      [
+        {
+          "node": "Review CV & Projects",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Review CV & Projects": {
+    "main": [
+      [
+        {
+          "node": "Prepare Sheet Row",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Prepare Sheet Row": {
+    "main": [
+      [
+        {
+          "node": "Append Applicant",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Append Applicant": {
+    "main": [
+      [
+        {
+          "node": "Read All Applicants",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Read All Applicants": {
+    "main": [
+      [
+        {
+          "node": "Compute Rank",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Compute Rank": {
+    "main": [
+      [
+        {
+          "node": "Update Rank in Sheet",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  },
+  "Update Rank in Sheet": {
+    "main": [
+      [
+        {
+          "node": "Send Confirmation DM",
+          "type": "main",
+          "index": 0
+        }
+      ]
+    ]
+  }
+}
+}
